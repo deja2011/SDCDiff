@@ -1,0 +1,152 @@
+#!/usr/bin/env python
+
+__author__ = 'Lawrence Li'
+__version__ = '2.0'
+__date__ = 'Fri Feb 27 2015'
+
+import sys
+import argparse
+import subprocess
+import threading
+import time
+import os
+from os import path as op
+
+from extractor import Extractor
+from comparator import Comparator
+
+
+def sdcdiff(f1, f2, cmd, product, verbose = True, stdout = sys.stdout, stderr = sys.stderr):
+    """Multiprocessed version of sdcdiff on command given by cmd.
+Return 0 if no differences are detected, otherwise a positive value.
+If verbose mode (on by default) is turned on, will export all 
+different cmds to stdout."""
+    pool_1, pool_2 = set(), set()
+    lock_1, lock_2 = threading.Lock(), threading.Lock()
+    all_done = threading.Event()
+    all_done.clear()
+
+    p_parser_1 = Extractor(f1, pool_1, cmd, product, stderr, lock_1)
+    p_parser_2 = Extractor(f2, pool_2, cmd, product, stderr, lock_2)
+    p_comparator = Comparator(pool_1, pool_2, lock_1, lock_2, all_done)
+
+    p_parser_1.start()
+    p_parser_2.start()
+    p_comparator.start()
+
+    p_parser_1.join()
+    p_parser_2.join()
+    all_done.set()
+    p_comparator.join()
+
+    res = len(p_comparator.pool_1) or len(p_comparator.pool_2)
+
+    if verbose:
+        for i, pool in enumerate((p_comparator.pool_1, p_comparator.pool_2)):
+            if pool:
+                stdout.write('+ Following command exists only in file_%d\n    ' % (i + 1))
+                stdout.write('\n    '.join(pool) + '\n\n')
+
+    return res
+
+
+def main():
+    parser = argparse.ArgumentParser(
+            prog = 'sdcdiff %s' % __version__,
+            usage = 'sdcdiff f1 f2 [-p dc|dcrt|icc2] [-i cmd1 cmd2 ...] [-e cmd1 cmd2 ...]',
+            )
+
+    parser.add_argument('f1', help = 'path to the 1st SDC file.') 
+    parser.add_argument('f2', help = 'path to the 2nd SDC file.') 
+    parser.add_argument('-p', '--product', choices = ('dc', 'dcrt', 'icc2'), default = 'dcrt', 
+            help = 'name of synopsys product in which sdcdiff is invoked: dc|dcrt|icc2') 
+    parser.add_argument('-v', '--verbose', action = 'store_true', default = False,
+            help = 'print verbose information.')
+    parser.add_argument('-r', '--raw_compare_only', action = 'store_true', default = False,
+            help = 'Stop after raw compare.')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-e', '--exclude', nargs = '*', 
+            help = 'Comparison will proceed without commands specified in this option. '
+            'If there are more than one command, they should be seperated by space. '
+            'Mutually exclusive with -i --include.')
+    group.add_argument('-i', '--include', nargs = '*',
+            help = 'Comparison will proceed only within commands specified in this option. '
+            'If there are more than one command, they should be seperated by space. '
+            'Mutually exclusive with -e --exclude.')
+
+    args = parser.parse_args()
+
+    for f in (args.f1, args.f2):
+        if not op.isfile(f):
+            sys.stderr.write('Error: %s is not a valid file.\n' % f)
+            sys.exit(-1)
+
+    cmdpool = open(op.join(op.dirname(op.dirname(op.realpath(__file__))), 
+            'lib', 'cmd.%s.list' % args.product), 'r').read().splitlines()
+    if args.include:
+        cmdpool = filter(lambda c: c in args.include, cmdpool)
+    elif args.exclude:
+        cmdpool = filter(lambda c: c not in args.exclude, cmdpool)
+    else:
+        pass
+
+    if not cmdpool:
+        sys.stderr.write('Error: No valid SDC commands to compare.\n')
+        sys.exit(-1)
+
+    sys.stdout.write('Launched sdcdiff at %s.\n' % time.ctime())
+    sys.stdout.write('FILE_1  : %s\n' % args.f1)
+    sys.stdout.write('FILE_2  : %s\n' % args.f2)
+    sys.stdout.write('PRODUCT : %s\n' % args.product)
+    sys.stdout.write('VERBOSE : %s\n' % args.verbose)
+    sys.stdout.write('RAW_COMP: %s\n\n' % args.raw_compare_only)
+
+    def raw_parse(f):
+        getcmds = op.join(op.dirname(op.realpath(__file__)), 'getcmds')
+        cmdlist = subprocess.check_output([getcmds, f]).split()
+        cmddict = {cmdlist[2*i]: int(cmdlist[2*i+1]) for i in range(len(cmdlist)/2) if cmdlist[2*i] in cmdpool}
+        return cmddict
+    cmds_1, cmds_2 = map(raw_parse, (args.f1, args.f2))
+
+    ret = 0
+    for i in (1, 2):
+        menuend = locals()['cmds_%d' % i]
+        subtractor = locals()['cmds_%d' % (3-i)]
+        cmds_diff = set(menuend.keys()) - set(subtractor.keys())
+        ret |= len(cmds_diff)
+        if cmds_diff:
+            sys.stdout.write('Following commands exist only in file %d %s:\n' % (i, getattr(args, 'f%d' % i)))
+            sys.stdout.write('\n  '.join(cmds_diff) + '\n\n')
+
+
+    cmdpool = filter(lambda c: c in cmdpool, set(cmds_1.keys()) & set(cmds_2.keys()))
+    if not cmdpool:
+        sys.stdout.write('Two SDC files do not have commands in common.\n')
+    else:
+        sys.stdout.write('Following commands exsit in both SDC files.\n  ')
+        sys.stdout.write('\n  '.join(cmdpool) + '\n\n')
+        sys.stdout.write('{0:<32}{1:<16}{2:<16}{3:<16}\n'.format('COMMAND', '# FILE_1', '# FILE_2', '# DIFF'))
+        sys.stdout.write('='*96 + '\n')
+        for cmd in cmdpool:
+            c1, c2 = cmds_1[cmd], cmds_2[cmd]
+            sys.stdout.write('{0:<32}{1:<16}{2:<16}{3:<16}\n'.format(cmd, c1, c2, c2 - c1))
+        sys.stdout.write('\n')
+        sys.stdout.flush()
+
+        if args.raw_compare_only:
+            return
+
+        for eachcmd in cmdpool:
+            sys.stdout.write('\nComparing command: %s\n' % eachcmd)
+            sys.stdout.flush()
+            cmd_res = sdcdiff(args.f1, args.f2, eachcmd, args.product, verbose = args.verbose)
+            sys.stdout.write('Commands of %s in two files are %s\n' % (eachcmd, ('DIFFERENT' if cmd_res else 'EQUIVALENT')))
+            ret |= cmd_res
+        sys.stdout.write('\n')
+
+    sys.stdout.write('Verification %s\n' % ('FAILED' if ret else 'SUCCEEDED'))
+    sys.stdout.flush()
+
+
+if __name__ == "__main__":
+  main()

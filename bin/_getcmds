@@ -1,0 +1,23 @@
+#!/u/szhang/pv/bin/parsetcl
+# vim: syntax=tcl
+
+array set cmdarray [list]
+
+proc parsetcl::command {comment cmdtext args} {
+    if {[llength $args]==0} {
+        return
+    }
+
+    set cmd [lindex $args 0]
+    if {[lsearch [array names ::cmdarray] $cmd] < 0} {
+        set ::cmdarray($cmd) 1
+    } else {
+        incr ::cmdarray($cmd)
+    }
+}
+
+
+# ----main----
+set fname [lindex $argv 0]
+parsetcl -file $fname
+puts -nonewline stdout [array get cmdarray]

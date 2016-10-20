@@ -1,0 +1,247 @@
+#!/u/szhang/pv/bin/parsetcl
+# vim: syntax=tcl
+
+############################################################
+# SDC Flat
+#==========================================================#
+# by: Sean Zhang, Lawrence Li
+# at: Aug, 2014
+############################################################
+
+namespace eval sdcflat {}
+
+proc checkvar {varname var} {
+    # Formatted output for debug usage.
+    return
+    set content [join $var " "]
+    puts [format "%-8s: %s" $varname $content]
+}
+
+proc debug_array {aname level} {
+    puts "================="
+    upvar $level $aname a
+    foreach k [array names a] {
+        puts [concat $k $a($k)]
+    }
+    puts "================="
+}
+
+proc flatten {coltype args} {
+
+    # Uniform grouping level of input collection expressions.
+    # Increase/decrease grouping level if necessary.
+    if {[llength [lindex ${args} 0]]==1} {
+        # Perform 1 level of grouping when collection is of format:
+        # Omitted
+        set args [list ${args}]
+    }
+    if {[string match "\{get_*" [lindex $args 0]]} {
+        # Perform 1 level of ungrouping when collection is of format:
+        # Omitted
+        set args [lindex $args 0]
+    }
+
+    foreach subcol $args {
+        if {$coltype != "_notype" && ![string match get_* [lindex $subcol 0]]} {
+            set subcol "get_${coltype}s $subcol"
+        }
+        foreach ele [lindex $subcol end 0] {
+            lappend ret [format {[%s %s]} [lindex $subcol 0] [string trimleft $ele]]
+        }
+    }
+    return $ret
+}
+
+proc parsesdc {cmdtext args} {
+
+    # First check if command contains options configured as _ignorecmd.
+    if {[info exists ::killers]} {
+        foreach opt $::killers {
+            if {[lsearch $args $opt] > 0} {return}
+        }
+    }
+
+    # cmd stores the output command.
+    set cmd [lindex $args 0]
+
+    # count stores the index of a token in output command.
+    set count 1
+
+    # nkwargstates is a list with same length of input command (args).
+    # Element is 1 when initialized, and is switched to 0 if the
+    # corresponding token is not non-keyword argument.
+    set nkwargstates [lrepeat [llength $args] 1]
+    lset nkwargstates 0 0
+
+    foreach opt $::opts_sorted {
+
+        # idx stores te index of a token in input command (args).
+        # Since it is possible for an option to appear multiple times
+        # in a command, search is done with -all.
+        set idxs [lsearch -all $args $opt]
+        foreach idx $idxs {
+        switch -- $::cmdopts($opt) {
+            _noval {
+                lappend cmd $opt
+                incr count 1
+                lset nkwargstates $idx 0
+            }
+            _novalomit {
+                lset nkwargstates $idx 0
+            }
+            cell -
+            lib_cell -
+            lib -
+            pin -
+            port -
+            net -
+            clock {
+                # Entry for argument as a collection expression.
+                # Add empty string to cmd to hold the place.
+                # Add entry to args2cmd to record mapping from args to cmd.
+                lappend cmd $opt ""
+                # arg2cmd is a mapping from index in input command (args),
+                # idx, to index in output command, count
+                set args2cmd([expr $idx + 1]) [expr $count + 1]
+                set idx2coltype([expr $idx + 1]) $::cmdopts($opt)
+                incr count 2
+                lset nkwargstates $idx 0
+                lset nkwargstates $idx+1 0
+            }
+            _omit {
+                lset nkwargstates $idx 0
+                lset nkwargstates $idx+1 0
+            }
+            default {
+                lappend cmd $opt [lindex $args $idx+1]
+                incr count 2
+                lset nkwargstates $idx 0
+                lset nkwargstates $idx+1 0
+            }
+        }
+        }
+    }
+
+    # nkwargidx is the index of a non-keyword argument among all
+    # non-keyword arguments.
+    set nkwargidx 0
+    for {set idx 1} {$idx < [llength $args]} {incr idx} {
+        if {[lindex $nkwargstates $idx] == 0} {
+            continue
+        }
+        if {[catch {
+        switch -- $::cmdopts(nkwarg_$nkwargidx) {
+            cell -
+            lib_cell -
+            lib -
+            pin -
+            port -
+            net -
+            clock {
+                # Entry for argument as a collection expression.
+                # Add empty string to cmd to hold the place.
+                # Add entry to args2cmd to record index mapping from args to cmd.
+                lappend cmd ""
+                set args2cmd($idx) $count
+                set idx2coltype($idx) $::cmdopts(nkwarg_$nkwargidx)
+                incr count 1
+            }
+            default {
+                lappend cmd [lindex $args $idx]
+                incr count 1
+            }
+        }
+        } result]} {
+            puts stderr "Warning: There are unresolved non-keyword arguments in $::cmdname.(SDCFLAT-001)"
+        }
+        incr nkwargidx
+    }
+
+    # Code to perform flatten iterations dynamically.
+    # Iteration levels is determined by number of entries in args2cmd
+    set code {}
+    set n 0
+    foreach idx [array names args2cmd] {
+        lappend code [subst -nocommands {foreach ele_$n [flatten $idx2coltype($idx) [lindex \$args $idx]] \{}]
+        incr n
+    }
+    set n 0
+    foreach idx [array names args2cmd] {
+        lappend code [subst -nocommands {lset cmd $args2cmd($idx) \$ele_$n}]
+        incr n
+    }
+    lappend code {puts [join $cmd]}
+    foreach idx [array names args2cmd] {
+        lappend code "\}"
+    }
+
+    eval [join $code \n]
+    
+    return 0
+}
+
+proc parsetcl::command {comment cmdtext args} {
+    if {[llength $args]==0} {
+        return
+    }
+
+    set cmd [lindex $args 0]
+    if {$cmd == $::cmdname} {
+        parsesdc $cmdtext {*}$args
+    } else {
+        return
+    }
+}
+
+
+proc parsetcl::bracket {comment cmdtext args} {
+
+    set cmd [lindex $args 0]
+
+    if {$cmd == "list"} {
+        return [eval $args]
+    }
+
+    # # tcl built-in command
+    # if [llength [info command ::$cmd]] {
+    #     return [eval $args]
+    # }
+
+    return $args
+}
+
+
+# ----main----
+
+set fname [lindex $argv 0]
+set cmdname [lindex $argv 1]
+set product [lindex $argv 2]
+set cfgname [file join [file dirname [file dirname [info script]]] "lib" "cmdopts.${product}.cfg"]
+source $cfgname
+catch {
+    array set cmdopts [set opts%$cmdname]
+}
+if {![array exists cmdopts]} {
+    puts stderr "Error: Missing configuration of [list $cmdname] in $cfgname.(SDCFLAT-000)"
+}
+
+# Store a copy of sorted option names.
+# When looping through options to parse the command, it is preferred to follow a
+# certain order to keep options in the flattened commands well ordered.
+# Simply looping in [array names cmdopts] cannot achieve this.
+# Sorted copy is stored as global variable to save runtime.
+set opts_sorted [lsort [array names cmdopts]]
+
+# If an option is marked as "_ignorecmd" in config file, commands with this option
+# will not be converted.
+# This is to ignore unwanted commands in MCMM.
+foreach opt $opts_sorted {
+    if {$cmdopts($opt) == "_ignorecmd"} {
+        lappend killers $opt
+    }
+}
+    
+parsetcl -file [lindex $argv 0]
+
+exit 0
+
